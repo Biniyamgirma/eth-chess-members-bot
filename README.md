@@ -1,0 +1,1 @@
+# eth-chess-members-bot
