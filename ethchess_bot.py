@@ -84,18 +84,33 @@ MENU_CURRENT_MATCHES = "Active matches"
 MENU_FIND_TABLE = "Find a table"
 MENU_LEAVE_TABLE = "Leave waiting table"
 MENU_BACK = "Main menu"
+MENU_BRILLIANT_MOVES = "Brilliant move"
+MENU_PROFILE = "View profile details"
+BRILLIANT_MOVE_SUBMIT = "Submit brilliant move"
+BRILLIANT_MOVE_LIST = "List this week's brilliant moves"
 MENU_ITEMS = (
     MENU_PLAY,
     "Get ethchess tournaments",
-    "View profile details",
+    MENU_PROFILE,
     "Analyze physical match history",
-    "Brilliant move",
+    MENU_BRILLIANT_MOVES,
+)
+BRILLIANT_MOVE_ITEMS = (
+    BRILLIANT_MOVE_SUBMIT,
+    BRILLIANT_MOVE_LIST,
+    MENU_BACK,
 )
 PHYSICAL_MATCH_ITEMS = (
     MENU_FIND_TABLE,
     MENU_CURRENT_MATCHES,
     MENU_LEAVE_TABLE,
     MENU_BACK,
+)
+
+BRILLIANT_MOVE_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton(item)] for item in BRILLIANT_MOVE_ITEMS],
+    resize_keyboard=True,
+    is_persistent=True,
 )
 
 MENU_KEYBOARD = ReplyKeyboardMarkup(
@@ -181,6 +196,8 @@ LOSER_RE = re.compile(
     r"match:loser:(self|opponent):([0-9]{1,12})(?::(-?[0-9]{1,20}))?"
 )
 CONFIRM_RE = re.compile(r"match:loser:([0-9]{1,12}):([a-fA-F0-9-]{8,64})")
+BRILLIANT_MOVE_VOTE_RE = re.compile(r"brilliant:vote:([0-9]{1,12})")
+BRILLIANT_MOVE_COUNT_RE = re.compile(r"brilliant:count:([0-9]{1,12})")
 
 PHONE_RE = re.compile(r"09[0-9]{8}")                       # e.g. 0912345678
 ETHCHESS_ID_RE = re.compile(r"(?:U|ETH)[A-Za-z0-9_-]{1,30}", re.IGNORECASE)
@@ -270,10 +287,18 @@ class RegistrationSession:
     created: float = field(default_factory=time.monotonic)
 
 
-SESSIONS: dict[str, LoginSession | RegistrationSession] = {}
+@dataclass
+class BrilliantMoveSession:
+    step: str
+    created: float = field(default_factory=time.monotonic)
 
 
-def get_session(chat_key: str) -> LoginSession | RegistrationSession | None:
+SESSIONS: dict[str, LoginSession | RegistrationSession | BrilliantMoveSession] = {}
+
+
+def get_session(
+    chat_key: str,
+) -> LoginSession | RegistrationSession | BrilliantMoveSession | None:
     session = SESSIONS.get(chat_key)
     if session and time.monotonic() - session.created > SESSION_TTL_SECONDS:
         SESSIONS.pop(chat_key, None)
@@ -281,7 +306,10 @@ def get_session(chat_key: str) -> LoginSession | RegistrationSession | None:
     return session
 
 
-def set_session(chat_key: str, session: LoginSession | RegistrationSession) -> None:
+def set_session(
+    chat_key: str,
+    session: LoginSession | RegistrationSession | BrilliantMoveSession,
+) -> None:
     if len(SESSIONS) >= MAX_SESSIONS:
         now = time.monotonic()
         for key in [k for k, s in SESSIONS.items() if now - s.created > SESSION_TTL_SECONDS]:
@@ -364,6 +392,52 @@ async def call_backend(
     if not response.is_success or payload.get("success") is not True:
         raise BackendError(clean_display(payload.get("message"), 300, DEFAULT_BACKEND_ERROR))
     return payload.get("data")
+
+
+async def call_brilliant_moves_backend(
+    context: ContextTypes.DEFAULT_TYPE, path: str, body: dict
+) -> Any:
+    url = f"{API_URL}/api/brilliant-moves/bot{path}"
+    try:
+        response = await http_client(context).post(
+            url,
+            headers={"x-ethchess-bot-secret": BOT_API_SECRET},
+            json=body,
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("Brilliant move backend request failed: %s", type(exc).__name__)
+        raise BackendError(DEFAULT_BACKEND_ERROR) from None
+
+    try:
+        payload = as_dict(response.json())
+    except ValueError:
+        payload = {}
+
+    if not response.is_success or payload.get("success") is not True:
+        raise BackendError(clean_display(payload.get("message"), 300, DEFAULT_BACKEND_ERROR))
+    return payload.get("data")
+
+
+async def get_member_profile(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> dict:
+    url = f"{API_URL}/api/members/bot/profile"
+    try:
+        response = await http_client(context).post(
+            url,
+            headers={"x-ethchess-bot-secret": BOT_API_SECRET},
+            json={"chat_id": str(chat_id)},
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("Telegram member profile request failed: %s", type(exc).__name__)
+        raise BackendError(DEFAULT_BACKEND_ERROR) from None
+
+    try:
+        payload = as_dict(response.json())
+    except ValueError:
+        payload = {}
+
+    if not response.is_success or payload.get("success") is not True:
+        raise BackendError(clean_display(payload.get("message"), 300, DEFAULT_BACKEND_ERROR))
+    return as_dict(payload.get("data"))
 
 
 # --------------------------------------------------------------------------- #
@@ -466,6 +540,141 @@ async def show_home(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
 
     name = clean_display(account.get("name"), 60, "your account")
     await send(context, chat_id, f"Your ethchess account is connected as {name}.", MENU_KEYBOARD)
+
+
+async def show_brilliant_move_menu(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int
+) -> None:
+    await send(
+        context,
+        chat_id,
+        "Brilliant move options:",
+        BRILLIANT_MOVE_KEYBOARD,
+    )
+
+
+def format_rating_set(value: Any, categories: tuple[str, ...]) -> str:
+    ratings = as_dict(value)
+    return ", ".join(
+        f"{category.title()}: {ratings.get(category) if isinstance(ratings.get(category), int) else 'N/A'}"
+        for category in categories
+    )
+
+
+async def show_member_profile(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int
+) -> None:
+    profile = await get_member_profile(context, chat_id)
+    full_name = clean_display(profile.get("full_name"), 120, "Not provided")
+    district = clean_display(profile.get("district_name"), 80, "Not provided")
+    address = clean_display(profile.get("address"), 200, "Not provided")
+    phone = clean_display(profile.get("phone"), 40, "Not provided")
+    telegram_username = clean_display(
+        profile.get("telegram_username"), 40, "Not provided"
+    )
+    chess_com_username = clean_display(
+        profile.get("chess_dot_com_username"), 60, "Not linked"
+    )
+    lichess_username = clean_display(
+        profile.get("lichess_username"), 60, "Not linked"
+    )
+    joined_at = clean_display(profile.get("createdAt"), 40, "Not available")
+    chess_com_ratings = format_rating_set(
+        profile.get("chess_dot_com_ratings"),
+        ("bullet", "blitz", "rapid"),
+    )
+    lichess_ratings = format_rating_set(
+        profile.get("lichess_ratings"),
+        ("bullet", "blitz", "rapid", "classical"),
+    )
+
+    await send(
+        context,
+        chat_id,
+        (
+            f"Profile details\n"
+            f"Name: {full_name}\n"
+            f"District: {district}\n"
+            f"Address: {address}\n"
+            f"Phone: {phone}\n"
+            f"Joined (Addis Ababa): {joined_at}\n"
+            f"Telegram username: {telegram_username}\n"
+            f"Chess.com: {chess_com_username}\n"
+            f"Chess.com ratings — {chess_com_ratings}\n"
+            f"Lichess: {lichess_username}\n"
+            f"Lichess ratings — {lichess_ratings}"
+        ),
+        MENU_KEYBOARD,
+    )
+
+
+async def show_current_week_brilliant_moves(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int
+) -> None:
+    submissions = as_dict_list(
+        await call_brilliant_moves_backend(context, "/week", {"chat_id": str(chat_id)})
+    )
+    if not submissions:
+        await send(
+            context,
+            chat_id,
+            "There are no brilliant moves submitted this week.",
+            BRILLIANT_MOVE_KEYBOARD,
+        )
+        return
+
+    has_voted = any(submission.get("has_voted") is True for submission in submissions)
+    for submission in submissions:
+        submission_id = to_int(submission.get("id"))
+        if submission_id is None:
+            continue
+
+        vote_count = to_int(submission.get("vote_count")) or 0
+        move_url = clean_display(submission.get("move_url"), 2048, "Link unavailable")
+        is_own = submission.get("is_own") is True
+        voted_for_this = submission.get("has_voted") is True
+        text = (
+            f"Brilliant move #{submission_id}\n"
+            f"Current vote: {vote_count}\n"
+            f"Link: {move_url}"
+        )
+
+        buttons = [
+            InlineKeyboardButton(
+                f"Current vote: {vote_count}",
+                callback_data=f"brilliant:count:{vote_count}",
+            )
+        ]
+        if is_own:
+            buttons.append(
+                InlineKeyboardButton(
+                    "Your submission",
+                    callback_data=f"brilliant:count:{vote_count}",
+                )
+            )
+        elif voted_for_this:
+            buttons.append(
+                InlineKeyboardButton(
+                    "Your vote",
+                    callback_data=f"brilliant:count:{vote_count}",
+                )
+            )
+        elif has_voted:
+            buttons.append(
+                InlineKeyboardButton(
+                    "Vote already cast",
+                    callback_data=f"brilliant:count:{vote_count}",
+                )
+            )
+        else:
+            buttons.append(
+                InlineKeyboardButton(
+                    "Click here to vote",
+                    callback_data=f"brilliant:vote:{submission_id}",
+                )
+            )
+
+        await send(context, chat_id, text, InlineKeyboardMarkup([buttons]))
 
 
 async def show_venues(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -1076,6 +1285,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         pattern.fullmatch(data)
         for pattern in (
             CONFIRM_RE,
+            BRILLIANT_MOVE_VOTE_RE,
+            BRILLIANT_MOVE_COUNT_RE,
             VENUE_RE,
             TABLE_RE,
             OPEN_TABLE_RE,
@@ -1130,10 +1341,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_answer(query, "This match button belongs to another chat.", alert=True)
         return
 
+    if m := BRILLIANT_MOVE_COUNT_RE.fullmatch(data):
+        await safe_answer(
+            query,
+            f"Current vote count: {m.group(1)}",
+            alert=True,
+        )
+        return
+
     # --- everything else ---------------------------------------------------
     await safe_answer(query)
     try:
-        if m := VENUE_RE.fullmatch(data):
+        if m := BRILLIANT_MOVE_VOTE_RE.fullmatch(data):
+            submission_id = int(m.group(1))
+            await call_brilliant_moves_backend(
+                context,
+                f"/{submission_id}/vote",
+                {"chat_id": str(chat_id)},
+            )
+            await send(context, chat_id, "Your vote has been recorded.")
+            await show_current_week_brilliant_moves(context, chat_id)
+        elif m := VENUE_RE.fullmatch(data):
             await show_venue_tables(context, chat_id, int(m.group(1)))
         elif m := TABLE_RE.fullmatch(data):
             table_id = int(m.group(1))
@@ -1202,13 +1430,26 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # --- no active login flow: main menu -----------------------------------
     if session is None:
-        if text in (*MENU_ITEMS, *PHYSICAL_MATCH_ITEMS):
+        if text in (*MENU_ITEMS, *PHYSICAL_MATCH_ITEMS, *BRILLIANT_MOVE_ITEMS):
             try:
                 account = await get_linked_account(context, chat_id)
                 if account is None:
                     await show_login(context, chat_id)
                 elif text == MENU_PLAY:
                     await show_physical_match_menu(context, chat_id)
+                elif text == MENU_BRILLIANT_MOVES:
+                    await show_brilliant_move_menu(context, chat_id)
+                elif text == MENU_PROFILE:
+                    await show_member_profile(context, chat_id)
+                elif text == BRILLIANT_MOVE_SUBMIT:
+                    set_session(chat_key, BrilliantMoveSession(step="move_url"))
+                    await send(
+                        context,
+                        chat_id,
+                        "Send the HTTPS link to your brilliant move.",
+                    )
+                elif text == BRILLIANT_MOVE_LIST:
+                    await show_current_week_brilliant_moves(context, chat_id)
                 elif text == MENU_FIND_TABLE:
                     await show_venues(context, chat_id)
                 elif text == MENU_CURRENT_MATCHES:
@@ -1235,6 +1476,31 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.exception("Menu action failed")
                 await send(context, chat_id, "Something went wrong. Please try again.")
         return
+
+    if isinstance(session, BrilliantMoveSession):
+        if session.step == "move_url":
+            try:
+                await call_brilliant_moves_backend(
+                    context,
+                    "/submit",
+                    {"chat_id": str(chat_id), "move_url": text},
+                )
+            except BackendError as exc:
+                await send(context, chat_id, exc.user_message)
+                return
+            except Exception:
+                logger.exception("Brilliant move submission failed")
+                await send(context, chat_id, "Unable to submit that link. Please try again.")
+                return
+
+            SESSIONS.pop(chat_key, None)
+            await send(
+                context,
+                chat_id,
+                "Your brilliant move was submitted.",
+                BRILLIANT_MOVE_KEYBOARD,
+            )
+            return
 
     if isinstance(session, RegistrationSession):
         if session.step == "first_name":
