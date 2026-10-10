@@ -10,7 +10,6 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
-
 import httpx
 from dotenv import load_dotenv
 from telegram import (
@@ -86,6 +85,7 @@ MENU_LEAVE_TABLE = "Leave waiting table"
 MENU_BACK = "Main menu"
 MENU_BRILLIANT_MOVES = "Brilliant move"
 MENU_PROFILE = "View profile details"
+MENU_LINK_CHESSCOM = "Link your Chess.com account"
 BRILLIANT_MOVE_SUBMIT = "Submit brilliant move"
 BRILLIANT_MOVE_LIST = "List this week's brilliant moves"
 MENU_ITEMS = (
@@ -106,6 +106,10 @@ PHYSICAL_MATCH_ITEMS = (
     MENU_LEAVE_TABLE,
     MENU_BACK,
 )
+PROFILE_ITEMS = (
+    MENU_LINK_CHESSCOM,
+    MENU_BACK,
+)
 
 BRILLIANT_MOVE_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton(item)] for item in BRILLIANT_MOVE_ITEMS],
@@ -121,6 +125,12 @@ MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 PHYSICAL_MATCH_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton(item)] for item in PHYSICAL_MATCH_ITEMS],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+PROFILE_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton(item)] for item in PROFILE_ITEMS],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -293,12 +303,20 @@ class BrilliantMoveSession:
     created: float = field(default_factory=time.monotonic)
 
 
-SESSIONS: dict[str, LoginSession | RegistrationSession | BrilliantMoveSession] = {}
+@dataclass
+class ChessComLinkSession:
+    step: str
+    created: float = field(default_factory=time.monotonic)
+
+
+SESSIONS: dict[
+    str, LoginSession | RegistrationSession | BrilliantMoveSession | ChessComLinkSession
+] = {}
 
 
 def get_session(
     chat_key: str,
-) -> LoginSession | RegistrationSession | BrilliantMoveSession | None:
+) -> LoginSession | RegistrationSession | BrilliantMoveSession | ChessComLinkSession | None:
     session = SESSIONS.get(chat_key)
     if session and time.monotonic() - session.created > SESSION_TTL_SECONDS:
         SESSIONS.pop(chat_key, None)
@@ -308,7 +326,7 @@ def get_session(
 
 def set_session(
     chat_key: str,
-    session: LoginSession | RegistrationSession | BrilliantMoveSession,
+    session: LoginSession | RegistrationSession | BrilliantMoveSession | ChessComLinkSession,
 ) -> None:
     if len(SESSIONS) >= MAX_SESSIONS:
         now = time.monotonic()
@@ -428,6 +446,30 @@ async def get_member_profile(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -
         )
     except httpx.HTTPError as exc:
         logger.warning("Telegram member profile request failed: %s", type(exc).__name__)
+        raise BackendError(DEFAULT_BACKEND_ERROR) from None
+
+    try:
+        payload = as_dict(response.json())
+    except ValueError:
+        payload = {}
+
+    if not response.is_success or payload.get("success") is not True:
+        raise BackendError(clean_display(payload.get("message"), 300, DEFAULT_BACKEND_ERROR))
+    return as_dict(payload.get("data"))
+
+
+async def link_chess_com_account(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, username: str
+) -> dict:
+    url = f"{API_URL}/api/members/bot/link-chesscom"
+    try:
+        response = await http_client(context).post(
+            url,
+            headers={"x-ethchess-bot-secret": BOT_API_SECRET},
+            json={"chat_id": str(chat_id), "chess_dot_com_username": username},
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("Chess.com account link request failed: %s", type(exc).__name__)
         raise BackendError(DEFAULT_BACKEND_ERROR) from None
 
     try:
@@ -604,7 +646,7 @@ async def show_member_profile(
             f"Lichess: {lichess_username}\n"
             f"Lichess ratings — {lichess_ratings}"
         ),
-        MENU_KEYBOARD,
+        PROFILE_KEYBOARD,
     )
 
 
@@ -1430,7 +1472,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # --- no active login flow: main menu -----------------------------------
     if session is None:
-        if text in (*MENU_ITEMS, *PHYSICAL_MATCH_ITEMS, *BRILLIANT_MOVE_ITEMS):
+        if text in (*MENU_ITEMS, *PROFILE_ITEMS, *PHYSICAL_MATCH_ITEMS, *BRILLIANT_MOVE_ITEMS):
             try:
                 account = await get_linked_account(context, chat_id)
                 if account is None:
@@ -1441,6 +1483,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     await show_brilliant_move_menu(context, chat_id)
                 elif text == MENU_PROFILE:
                     await show_member_profile(context, chat_id)
+                elif text == MENU_LINK_CHESSCOM:
+                    set_session(chat_key, ChessComLinkSession(step="username"))
+                    await send(
+                        context,
+                        chat_id,
+                        "Enter your Chess.com username (2-25 letters, numbers, underscores, or hyphens).",
+                    )
                 elif text == BRILLIANT_MOVE_SUBMIT:
                     set_session(chat_key, BrilliantMoveSession(step="move_url"))
                     await send(
@@ -1501,6 +1550,46 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 BRILLIANT_MOVE_KEYBOARD,
             )
             return
+
+    if isinstance(session, ChessComLinkSession) and session.step == "username":
+        username = text.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{2,25}", username):
+            await send(
+                context,
+                chat_id,
+                "Enter a valid Chess.com username using 2-25 letters, numbers, underscores, or hyphens.",
+            )
+            return
+
+        try:
+            account = await link_chess_com_account(context, chat_id, username)
+        except BackendError as exc:
+            await send(context, chat_id, exc.user_message)
+            return
+        except Exception:
+            logger.exception("Chess.com account linking failed")
+            await send(context, chat_id, "Unable to link that account right now. Please try again.")
+            return
+
+        SESSIONS.pop(chat_key, None)
+        linked_username = clean_display(
+            account.get("chess_dot_com_username"), 25, username
+        )
+        ratings = format_rating_set(
+            {
+                "bullet": account.get("chess_dot_com_bullet_rating"),
+                "blitz": account.get("chess_dot_com_blitz_rating"),
+                "rapid": account.get("chess_dot_com_rapid_rating"),
+            },
+            ("bullet", "blitz", "rapid"),
+        )
+        await send(
+            context,
+            chat_id,
+            f"Chess.com account {linked_username} linked.\nRatings — {ratings}",
+            PROFILE_KEYBOARD,
+        )
+        return
 
     if isinstance(session, RegistrationSession):
         if session.step == "first_name":

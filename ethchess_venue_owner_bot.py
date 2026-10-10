@@ -91,16 +91,18 @@ MAX_SESSIONS = 10_000
 # UI
 # --------------------------------------------------------------------------- #
 MENU_ACTIONS = {
-    "Add venue table": "table",
+    "Add venue table": "table_menu",
     "Cancel a match": "cancel",
     "Start match": "start",
     "View active matches": "active",
+    "Generate invoice": "invoice",
 }
 
 MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("Add venue table"), KeyboardButton("Cancel a match")],
         [KeyboardButton("Start match"), KeyboardButton("View active matches")],
+        [KeyboardButton("Generate invoice")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -113,10 +115,13 @@ LOGIN_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("Login", callback_d
 # --------------------------------------------------------------------------- #
 # Callback data is attacker-controllable, so every pattern is anchored with
 # fullmatch, ASCII-only and length-bounded.
-VENUE_RE = re.compile(r"owner:venue:(table|cancel|start|active):([0-9]{1,12})")
+VENUE_RE = re.compile(r"owner:venue:(table_menu|table|table_add|table_activate|table_deactivate|cancel|start|active|invoice):([0-9]{1,12})")
 TABLE_RE = re.compile(r"owner:table:([0-9]{1,12}):([0-9]{1,12})")
+TABLE_STATUS_RE = re.compile(r"owner:table-status:(activate|deactivate):([0-9]{1,12}):([0-9]{1,12})")
 CANCEL_RE = re.compile(r"owner:cancel:([0-9]{1,12})")
 CANCEL_CONFIRM_RE = re.compile(r"owner:cancel-confirm:([0-9]{1,12})")
+CANCEL_REASON_RE = re.compile(r"owner:cancel-reason:([0-9]{1,12}):([0-9]{1,12})")
+INVOICE_STATUS_RE = re.compile(r"owner:invoice-status:(paid|cancel):([0-9]{1,12})")
 
 PHONE_RE = re.compile(r"09[0-9]{8}")                       # e.g. 0912345678
 ETHCHESS_ID_RE = re.compile(r"(?:U|ETH)[A-Za-z0-9_-]{1,30}", re.IGNORECASE)
@@ -271,21 +276,22 @@ async def call_backend(
     path: str,
     body: dict | None = None,
     chat_id: int | None = None,
+    method: str | None = None,
 ) -> Any:
-    """Call /api/venue-owner-bot{path}. GET when body is None, otherwise POST.
-
-    For GET requests chat_id is sent as a query parameter (properly encoded
-    by httpx), exactly like the original `?chat_id=...`.
-    """
+    """Call /api/venue-owner-bot{path}, sending request data in the JSON body."""
+    print(f"Calling backend: {path} (chat_id={chat_id})")
     url = f"{API_URL}/api/venue-owner-bot{path}"
-    params = {"chat_id": str(chat_id)} if (body is None and chat_id is not None) else None
+    request_body = body
+    if chat_id is not None:
+        request_body = {**(body or {}), "chat_id": str(chat_id)}
+    request_method = method or ("POST" if request_body is not None else "GET")
+    print(f"Request URL: {url} (body={request_body})")
     try:
         response = await http_client(context).request(
-            "POST" if body is not None else "GET",
+            request_method,
             url,
             headers={"x-ethchess-bot-secret": BOT_API_SECRET},
-            params=params,
-            json=body,
+            json=request_body,
         )
     except httpx.HTTPError as exc:
         logger.warning("Backend request failed: %s", type(exc).__name__)
@@ -350,6 +356,80 @@ async def delete_quietly(message) -> None:
         pass
 
 
+def invoice_amount(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value:,.2f}"
+    return "0.00"
+
+
+async def send_invoice(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    invoice: dict,
+) -> None:
+    invoice_id = to_int(invoice.get("id"))
+    if invoice_id is None:
+        raise BackendError("The invoice was created but its number could not be read.")
+
+    matches = as_dict_list(invoice.get("matches"))
+    total_minutes = to_int(invoice.get("total_minutes")) or 0
+    prices = {
+        float(match["price_per_minute"])
+        for match in matches
+        if isinstance(match.get("price_per_minute"), (int, float))
+        and not isinstance(match.get("price_per_minute"), bool)
+    }
+    total_amount = invoice_amount(invoice.get("total_amount"))
+    amount_formula = (
+        f"{total_minutes} minutes × {invoice_amount(next(iter(prices)))} per minute"
+        if len(prices) == 1
+        else "sum of match amounts"
+    )
+    lines = [
+        f"INVOICE #{invoice_id}",
+        f"Customer: {clean_display(as_dict(invoice.get('member')).get('name'), 100, 'Unknown customer')}",
+        "",
+        "Matches:",
+    ]
+    for match in matches:
+        lines.extend([
+            (
+                f"{clean_display(match.get('white_player_name'), 80, '?')} VS "
+                f"{clean_display(match.get('black_player_name'), 80, '?')}"
+            ),
+            f"Minutes played: {to_int(match.get('minutes')) or 0}",
+            f"Date (Addis Ababa): {clean_display(match.get('played_at_addis_ababa'), 32, 'Unknown')}",
+            f"Venue price per minute: {invoice_amount(match.get('price_per_minute'))}",
+            f"Amount: {invoice_amount(match.get('amount'))}",
+            "",
+        ])
+    lines.extend([
+        f"Total minutes: {total_minutes}",
+        f"Total amount: {amount_formula} = {total_amount}",
+        "Status: Pending",
+    ])
+
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        next_text = f"{current}\n{line}" if current else line
+        if len(next_text) > 3800 and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = next_text
+    if current:
+        chunks.append(current)
+
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Paid", callback_data=f"owner:invoice-status:paid:{invoice_id}"),
+        InlineKeyboardButton("Cancel", callback_data=f"owner:invoice-status:cancel:{invoice_id}"),
+    ]])
+    for chunk in chunks[:-1]:
+        await send(context, chat_id, chunk)
+    await send(context, chat_id, chunks[-1], markup)
+
+
 # --------------------------------------------------------------------------- #
 # Venue owner workflows
 # --------------------------------------------------------------------------- #
@@ -360,7 +440,9 @@ async def show_login(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
 
 async def begin_venue_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action: str) -> None:
     venues = []
-    for venue in as_dict_list(await call_backend(context, "/venues", chat_id=chat_id)):
+    for venue in as_dict_list(await call_backend(
+        context, "/venues", chat_id=chat_id, method="POST"
+    )):
         venue_id = to_int(venue.get("id"))
         if venue_id is not None:
             venues.append((venue_id, clean_display(venue.get("name"), 40, f"Venue {venue_id}")))
@@ -383,16 +465,65 @@ async def begin_venue_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int, a
 
 
 async def run_venue_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action: str, venue_id: int) -> None:
-    if action == "table":
+    if action in ("table_menu", "table"):
+        await send(
+            context, chat_id, "Manage venue tables:",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("Add tables", callback_data=f"owner:venue:table_add:{venue_id}")],
+                [InlineKeyboardButton("Deactivate tables", callback_data=f"owner:venue:table_deactivate:{venue_id}")],
+                [InlineKeyboardButton("Activate tables", callback_data=f"owner:venue:table_activate:{venue_id}")],
+            ]),
+        )
+        return
+
+    if action == "table_add":
         set_session(str(chat_id), Session(step="table_name", venue_id=venue_id))
         await send(context, chat_id, "Send a name for the new table, or use /cancel.")
         return
 
+    if action in ("table_activate", "table_deactivate"):
+        tables = as_dict_list(
+            await call_backend(
+                context, f"/venues/{venue_id}/tables/list", chat_id=chat_id, method="POST"
+            )
+        )
+        desired_status = 0 if action == "table_activate" else 1
+        next_action = "activate" if action == "table_activate" else "deactivate"
+        buttons = []
+        for table in tables:
+            table_id = to_int(table.get("id"))
+            if table_id is None or to_int(table.get("status")) != desired_status:
+                continue
+            name = clean_display(table.get("name"), 40, f"Table {table_id}")
+            buttons.append([InlineKeyboardButton(
+                name,
+                callback_data=f"owner:table-status:{next_action}:{venue_id}:{table_id}",
+            )])
+        if not buttons:
+            state = "inactive" if action == "table_activate" else "active"
+            await show_menu(context, chat_id, f"There are no {state} tables to {next_action}.")
+            return
+        await send(
+            context, chat_id, f"Choose a table to {next_action}:",
+            InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if action == "invoice":
+        set_session(str(chat_id), Session(step="invoice_member", venue_id=venue_id))
+        await send(
+            context, chat_id,
+            "Enter the member's phone number (starting with 09) or EthChess ID to generate an invoice.",
+        )
+        return
+
     if action == "start":
         buttons = []
-        for table in as_dict_list(await call_backend(context, f"/venues/{venue_id}/tables", chat_id=chat_id)):
+        for table in as_dict_list(await call_backend(
+            context, f"/venues/{venue_id}/tables/list", chat_id=chat_id, method="POST"
+        )):
             table_id = to_int(table.get("id"))
-            if table_id is not None and table.get("is_available"):
+            if table_id is not None and to_int(table.get("status")) == 1 and table.get("is_available"):
                 name = clean_display(table.get("name"), 40, f"Table {table_id}")
                 buttons.append([InlineKeyboardButton(name, callback_data=f"owner:table:{venue_id}:{table_id}")])
         if not buttons:
@@ -403,7 +534,9 @@ async def run_venue_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int, act
 
     if action in ("active", "cancel"):
         matches = []
-        for match in as_dict_list(await call_backend(context, f"/venues/{venue_id}/matches", chat_id=chat_id)):
+        for match in as_dict_list(await call_backend(
+            context, f"/venues/{venue_id}/matches", chat_id=chat_id, method="POST"
+        )):
             match_id = to_int(match.get("id"))
             if match_id is None:
                 continue
@@ -511,17 +644,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_answer(query)
         return
 
-    # --- cancellation confirm (answers the query itself after the backend call)
-    if m := CANCEL_CONFIRM_RE.fullmatch(data):
+    # --- cancellation reason selection -----------------------------------
+    if m := CANCEL_REASON_RE.fullmatch(data):
+        match_id, reason_id = int(m.group(1)), int(m.group(2))
         try:
             result = as_dict(await call_backend(
-                context, f"/matches/{int(m.group(1))}/cancel", {"chat_id": str(chat_id)}
+                context,
+                f"/matches/{match_id}/cancel",
+                {
+                    "chat_id": str(chat_id),
+                    "cancellation_reason": reason_id,
+                },
             ))
             await safe_answer(query, "Match cancelled.")
             cancelled_id = to_int(result.get("id"))
             await show_menu(
-                context, chat_id,
-                f"Match {cancelled_id if cancelled_id is not None else m.group(1)} was cancelled.",
+                context,
+                chat_id,
+                f"Match {cancelled_id if cancelled_id is not None else match_id} was cancelled.",
             )
         except BackendError as exc:
             await safe_answer(query, exc.user_message, alert=True)
@@ -532,6 +672,68 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await send(context, chat_id, "Unable to complete that action.")
         return
 
+    # --- cancellation confirm: ask the backend for available reasons ------
+    if m := CANCEL_CONFIRM_RE.fullmatch(data):
+        try:
+            reasons = as_dict_list(await call_backend(
+                context,
+                "/cancellation-reasons",
+                {"chat_id": str(chat_id)},
+            ))
+            buttons = []
+            for reason in reasons:
+                reason_id = to_int(reason.get("id"))
+                if reason_id is None:
+                    continue
+                name = clean_display(reason.get("name"), 50, f"Reason {reason_id}")
+                buttons.append([InlineKeyboardButton(
+                    name,
+                    callback_data=f"owner:cancel-reason:{int(m.group(1))}:{reason_id}",
+                )])
+            await safe_answer(query)
+            if not buttons:
+                await send(
+                    context,
+                    chat_id,
+                    "There are no active cancellation reasons. The match was not cancelled.",
+                )
+                return
+            await send(
+                context,
+                chat_id,
+                "Choose a reason for cancelling this match:",
+                InlineKeyboardMarkup(buttons),
+            )
+        except BackendError as exc:
+            await safe_answer(query, exc.user_message, alert=True)
+            await send(context, chat_id, exc.user_message)
+        except Exception:
+            logger.exception("Match cancellation failed")
+            await safe_answer(query, "Unable to complete that action.", alert=True)
+            await send(context, chat_id, "Unable to complete that action.")
+        return
+
+    if m := INVOICE_STATUS_RE.fullmatch(data):
+        action, invoice_id = m.group(1), int(m.group(2))
+        status = "paid" if action == "paid" else "canceled"
+        try:
+            await call_backend(
+                context,
+                f"/invoices/{invoice_id}/status",
+                {"chat_id": str(chat_id), "status": status},
+                method="PATCH",
+            )
+            await safe_answer(query, f"Invoice #{invoice_id} marked {status}.")
+            await show_menu(context, chat_id, f"Invoice #{invoice_id} marked {status}.")
+        except BackendError as exc:
+            await safe_answer(query, exc.user_message, alert=True)
+            await send(context, chat_id, exc.user_message)
+        except Exception:
+            logger.exception("Invoice status update failed")
+            await safe_answer(query, "Unable to update invoice.", alert=True)
+            await send(context, chat_id, "Unable to update invoice.")
+        return
+
     # --- everything else ---------------------------------------------------
     await safe_answer(query)
     try:
@@ -540,6 +742,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await send(context, chat_id, "Enter the phone number on your venue owner account.")
         elif m := VENUE_RE.fullmatch(data):
             await run_venue_action(context, chat_id, m.group(1), int(m.group(2)))
+        elif m := TABLE_STATUS_RE.fullmatch(data):
+            action, venue_id, table_id = m.group(1), int(m.group(2)), int(m.group(3))
+            await call_backend(
+                context,
+                f"/venues/{venue_id}/tables/{table_id}/{action}",
+                {"chat_id": str(chat_id)},
+                method="PATCH",
+            )
+            await show_menu(context, chat_id, f"Table {table_id} {action}d.")
         elif m := TABLE_RE.fullmatch(data):
             await begin_manual_match(context, chat_id, int(m.group(1)), int(m.group(2)))
         elif m := CANCEL_RE.fullmatch(data):
@@ -654,6 +865,28 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             table_id = to_int(table.get("id"))
             label = clean_display(table.get("name"), 40, f"Table {table_id}" if table_id is not None else name)
             await show_menu(context, chat_id, f"Added {label}.")
+            return
+
+        if session.step == "invoice_member" and session.venue_id is not None:
+            member_identifier = clean_identifier(text)
+            if not is_player_identifier(member_identifier):
+                await send(
+                    context, chat_id,
+                    "Enter a phone number starting with 09 or an EthChess ID starting with U or ETH.",
+                )
+                return
+            invoice_input = (
+                {"phone": member_identifier}
+                if PHONE_RE.fullmatch(member_identifier)
+                else {"member_id": member_identifier}
+            )
+            invoice = as_dict(await call_backend(
+                context,
+                f"/venues/{session.venue_id}/invoices",
+                {"chat_id": chat_key, **invoice_input},
+            ))
+            SESSIONS.pop(chat_key, None)
+            await send_invoice(context, chat_id, invoice)
             return
 
         # --- manual match: players ----------------------------------------
